@@ -39,6 +39,10 @@ local ime_wrapped = false
 -- vterm 等全屏终端复用引擎增强模式，但候选串画在它自己预留的条带上：
 -- 注册进来的 sink 取代条带 widget 成为候选出口（不新建 widget、不盖功能键）。
 local external_sink = nil
+-- vterm widget 本体模式：imebar 的 ImeBar widget 锚定到 vterm 预留条带位，
+-- 直接由它绘候选（取代 vterm 自绘条）。external_widget=true 时候选走 widget，
+-- 不走 sink；显示期间屏蔽 barFollowKeyboard 对全屏框的自动 close。
+local external_widget = false
 
 local function enabled()
     return G_reader_settings and G_reader_settings:nilOrTrue(ENABLED_KEY)
@@ -53,6 +57,43 @@ end
 -- 当前是否该接管候选显示（条带挂上了，或外部终端注册了候选出口）。
 local function active()
     return installed and enabled() and ((bar and bar._shown) or external_sink ~= nil)
+end
+
+-- vterm widget 本体模式：让 imebar 的 widget 显示在调用方（vterm）预留的
+-- 条带矩形里。字体两边都用 cfont（见 vterm_view bar_face），故几何天然一致，
+-- 无需注入 face/重算。kb = 键盘实例（提供 inputbox 给触摸回调）；
+-- rect = {x,y,w,h} 屏幕坐标。返回 false 表示插件未就绪。
+local function mountExternal(kb, rect)
+    if not installed or not enabled() or not bar then return false end
+    if type(rect) ~= "table" or not rect.x or not rect.y or not rect.w or not rect.h then
+        return false
+    end
+    external_widget = true
+    bar._external_rect = { x = rect.x, y = rect.y, w = rect.w, h = rect.h }
+    guarded(function() bar:show(kb) end)
+    local IME = package.loaded[ENGINE_MODULE]
+    if IME then
+        IME.imebar_inline_code = true
+        -- 与 sink 模式同理：v 缓冲预览走 widget 条带，但缓冲正文仍须逐键写输入框，
+        -- v 缓冲只走条带、不逐键写输入框：逐键写时单空格追加的 " " 恰等于所按
+        -- 字符，会被 vterm 差分当成直通字符发 PTY（单空格上屏）。提交改由 vCommit
+        -- 末尾的 _vtCommitDraft() 显式完成，整串一次发，输入框在组合期保持干净。
+        IME.imebar_external_vmode = false
+    end
+    return true
+end
+
+local function unmountExternal()
+    external_widget = false
+    if not bar then return end
+    guarded(function() bar:close() end)
+    bar._external_rect = nil
+    bar._external_face = nil
+    local IME = package.loaded[ENGINE_MODULE]
+    if IME then
+        IME.imebar_inline_code = false
+        IME.imebar_external_vmode = false
+    end
 end
 
 -- 外部候选出口（vterm 全屏框）：候选串画在 vterm 自己预留的条带位，
@@ -102,6 +143,14 @@ end
 -- 引擎也绝不会卡在过期的 inline_code 上往输入框误写拼音码。
 -- 唯一状态来源 = bar._shown（vterm 全屏框 hasRoom=false → 恒 false）。
 local function barFollowKeyboard(kb, show)
+    -- widget 本体模式（vterm）：键盘 onClose（收键盘/toggleKeyboard 重建）必须
+    -- 关掉锚定 widget，否则它残留在屏幕中间/下方。unmountExternal 会复位门控并
+    -- 清 _shown；展开后新 view 的 paintTo 会重新 mount 到新条带位。
+    -- show=true 不在这里 mount —— 由 vterm 拿到新几何后调 mountExternal。
+    if external_widget then
+        if not show then unmountExternal() end
+        return
+    end
     local IME = package.loaded[ENGINE_MODULE]
     if show then
         guarded(function() bar:show(kb) end)
@@ -169,8 +218,8 @@ local function wrapIME()
     end
 
     local orig_getHintChars = IME.getHintChars
-    IME.getHintChars = function(self, ...)
-        local full = orig_getHintChars(self, ...)
+    IME.getHintChars = function(self, inputbox)
+        local full = orig_getHintChars(self, inputbox)
         if not active() then return full end
         -- orig 已按完整串设好 hint_char_count/on_stage_char_count。
         -- 条带显完整串（含舞台字）；输入框只写舞台字：hint_char_count 清零
@@ -181,7 +230,9 @@ local function wrapIME()
             if sink then
                 sink.setText(full) -- 外部终端：完整串画在它自己的条带位
             elseif full ~= "" then
-                bar:setCandidates(full)
+                -- 第三参 = 当前页布局（同一时刻取数，状态一致），条带据此算
+                -- 触摸命中矩形；视觉不变，闭包里不写 ...（看不到外层 vararg）
+                bar:setCandidates(full, nil, self:getBarLayout(inputbox))
             else
                 bar:clearCandidates()
             end
@@ -247,6 +298,29 @@ local function install()
 
     bar = ImeBar:new{}
 
+    -- 触摸选字回调（条带 onGesture 命中后调，均经 bar 侧 pcall 包裹）：
+    -- 候选 n（1=舞台字，10=0 键位）→ 引擎活实例的 tapSelectCandidate（数字
+    -- 选字的提交行，绕开自定义码前缀吞数字的分支）；翻页 → 重放键盘 →/←
+    -- 的既有路径（wrappedAddChars 的翻页分支，条带只在有编号候选时才有矩形）。
+    bar._on_candidate = function(n, kb)
+        local engine = package.loaded[ENGINE_MODULE]
+        local ime = type(engine) == "table" and engine._live
+        if ime and kb.inputbox then
+            ime:tapSelectCandidate(kb.inputbox, n)
+            -- vterm 等全屏终端：触摸直接调引擎绕过了键盘事件边界，候选字只进
+            -- 草稿不发 PTY（键盘选字则经 addChars.func → _vtKeyEventEnd 自动收口）。
+            -- 有补提交方法就调它，普通输入框没有此方法则无感（原生 InputDialog
+            -- 的草稿本来就地显示、不需发 PTY）。
+            local commit = kb.inputbox._vtCommitDraft
+            if type(commit) == "function" then commit(kb.inputbox) end
+        end
+    end
+    bar._on_page = function(dir, kb)
+        if kb.inputbox then
+            kb.inputbox:addChars(dir == "next" and "→" or "←")
+        end
+    end
+
     -- VirtualKeyboard:init 里 layout（含 IME 类）刚 require 完，正是挂钩时机。
     local orig_init = VirtualKeyboard.init
     VirtualKeyboard.init = function(self, ...)
@@ -292,7 +366,11 @@ do
 end
 -- vterm 等全屏终端通过 package.loaded 发现辣条并注册外部候选出口（它按路径
 -- dofile 插件 main，拿不到返回值）。用独立键名，别覆盖 require("imebar") 的 widget 模块。
-package.loaded["imebar_api"] = { setExternalSink = setExternalSink }
+package.loaded["imebar_api"] = {
+    setExternalSink = setExternalSink,
+    mountExternal = mountExternal,   -- vterm widget 本体模式：把辣条 widget 锚到 vterm 条带位
+    unmountExternal = unmountExternal,
+}
 if not installed then
     logger.warn("imebar: install failed, native input stays")
 else
@@ -558,17 +636,9 @@ function ImeBarPlugin:addToMainMenu(menu_items)
                     -- 分段用空白行隔离，段落短小便于扫读
                     UIManager:show(InfoMessage:new{
                         text = L("拼音辣条 (imebar)", "Pinyin Input Bar (imebar)")
-                            .. "  v" .. meta.version .. "\n\n" .. table.concat(L({
-                            "自带拼音引擎：候选显示在软键盘上方。",
-                            "支持数字选字、←/→ 翻页、模糊拼音、记忆词、自定义词组、v 模式英文直通。",
-                            "运行时接管系统输入法，不改任何系统文件；与 imeplus 共存时 imebar 优先。",
-                            "非拼音布局或全屏输入框自动回退原生行为。",
-                        }, {
-                            "Self-contained pinyin IME: candidates in a bar above the soft keyboard.",
-                            "Numbered picks, ←/→ paging, fuzzy pinyin, word memory, custom phrases, v-mode English passthrough.",
-                            "Takes over the system IME at runtime, no system files touched. imebar wins over imeplus if both are installed.",
-                            "Falls back to native behavior on non-pinyin layouts and fullscreen boxes.",
-                        }), "\n\n")
+                            .. "  v" .. meta.version .. "\n"
+                            .. L("自带拼音引擎，候选显示在软键盘上方。", "Self-contained pinyin IME with a candidate bar.")
+                            .. "\nhttps://github.com/eznas/imebar.koplugin"
                     })
                 end,
                 keep_menu_open = true,

@@ -35,8 +35,6 @@ local FUZZY_PRESETS = {
 -- the abbreviation gate regardless of which fuzzy rules the user enabled.
 local RETROFLEX = { z = "zh", c = "ch", s = "sh" }
 local FUZZY_MAX_VARIANTS = 16
--- imebar: 每个码桶保留的候选上限（rime 序即词频序，尾部皆生僻字）。
-local CANDI_BUCKET_CAP = 15
 
 local function fuzzy_enabled()
     if G_reader_settings then
@@ -342,19 +340,6 @@ function IME:init()
     self:clear_stack()
 
     loadUserWords(self)
-
-    -- imebar: stock 桶按 rime 词频序，尾部是繁体/异体/生僻字（ba 的 罷、
-    -- an 的 盦儑銨雸），翻页时一堆「相关性不强」的候选。桶长封顶截掉这
-    -- 段 —— 数据里多字词全在前 15 位内（已扫描确认），截尾不丢词。
-    local CAP = CANDI_BUCKET_CAP
-    for _, list in pairs(self.code_map) do
-        if type(list) == "table" and #list > CAP then
-            local capped = {}
-            for i = 1, CAP do capped[i] = list[i] end
-            -- 就地截短而非换表：getAllStartsWith/looseMatch 等都直接读这张表
-            for i = #list, CAP + 1, -1 do list[i] = nil end
-        end
-    end
 
     self.sorted_codes = {}
     for k,_ in pairs(self.code_map) do
@@ -924,6 +909,50 @@ function IME:getHintChars(inputbox)
     return hint_chars
 end
 
+-- imebar: 当前页触摸选字布局（imebar.lua 据此算点击命中矩形）。镜像上面
+-- getHintChars 的编号窗口分支：同一时刻调用（包裹体里紧跟 getHintChars），
+-- 状态一致。不显示编号窗口的态（非拼音/无候选/自定义码前缀吞码/页大小<2）
+-- 返回 nil，条带在这些态下没有任何可点矩形。
+function IME:getBarLayout(inputbox)
+    if not isPinyin(self) then return nil end
+    local imex = _stack[#_stack]
+    if not (self:show_candi_callback() and #imex.candi > 1 and #imex.code > 0) then return nil end
+    local starts = getPages(imex, inputbox)
+    local page_no = curPageNo(starts, imex.index)
+    local page_size = pageSizeAt(starts, page_no, #imex.candi)
+    if page_size < 2 then return nil end
+    local cands = {}
+    local last = math.min(imex.index + page_size - 1, #imex.candi)
+    for i = imex.index + 1, last do
+        cands[#cands+1] = { n = i - imex.index + 1, text = imex.candi[i] }
+    end
+    -- 舞台字 = 全部栈层 char 串接（getHintChars 的括号前缀）
+    local stage = ""
+    for i = 1, #_stack do stage = stage .. (_stack[i].char or "") end
+    return {
+        stage = stage,
+        cands = cands,
+        has_prev = page_no > 1,
+        has_next = page_no < #starts,
+    }
+end
+
+-- imebar: 触摸点选第 n 个候选（n=1 为舞台字，10 为 0 键位）。直接走数字
+-- 选字的提交行（1298-1301），不经数字键分支 —— 自定义码前缀态（数字被吞进
+-- 组合）下点可见候选仍应上屏该候选，而非往组合里加数字。越界静默不动。
+function IME:tapSelectCandidate(inputbox, n)
+    local imex = _stack[#_stack]
+    local starts = getPages(imex, inputbox)
+    local page_no = curPageNo(starts, imex.index)
+    local page_size = pageSizeAt(starts, page_no, #imex.candi)
+    local target = imex.index + n - 1
+    if n <= page_size and imex.candi[target] then
+        imex.char = imex.candi[target]
+        self:refreshHintChars(inputbox)
+        self:separate(inputbox)
+    end
+end
+
 function IME:refreshHintChars(inpuxbox)
     -- imebar: 拼音组合期间输入框实时显示原始拼音字母（如 fangfa），候选窗口
     -- 推给键盘上方条带；选字提交时（separate）删码写汉字覆盖。
@@ -990,6 +1019,11 @@ function IME:vCommit(inputbox, trim_tail)
     end
     self.v_in_field = nil
     if self.imebar_bar_push then self.imebar_bar_push("") end
+    -- vterm 全屏终端：v 缓冲正文是 raw_method_call 写进草稿的，绕过了键盘
+    -- 事件边界，差分会把它当「组词写入」而不发 PTY（表现为双空格/回车后正文
+    -- 不上屏）。有补提交方法就显式提交；普通 InputDialog 无此方法则无感。
+    local commit = inputbox._vtCommitDraft
+    if type(commit) == "function" then commit(inputbox) end
 end
 
 -- 显示 v 缓冲：条带在（inline_code 开）→ 条带显缓冲（去 v），输入框干净；
@@ -1001,7 +1035,10 @@ function IME:vPush(inputbox, old_len)
     -- 路径、没推条带 → 「看不到预览、和辣条不一致」，这里补齐。
     if self.imebar_inline_code and self.imebar_bar_push then
         local body = self.v_text and self.v_text:sub(2) or ""
-        self.imebar_bar_push(body, body == "")
+        -- 有正文时末尾加下划线作输入光标指示（如 "Hello_"）；仅显示，
+        -- 不进 v_text，提交时不会带上。空缓冲显灰字提示，不加下划线。
+        local shown = (body ~= "") and (body .. "_") or body
+        self.imebar_bar_push(shown, body == "")
         -- 外部终端（vterm）里缓冲仍须逐键直写输入框：一次性写整串会被 vterm
         -- 的差分规则当成「组词写入」而永不发 PTY。逐键直显才会被差分认出。
         if self.imebar_external_vmode then
@@ -1155,9 +1192,15 @@ function IME:wrappedAddChars(inputbox, char, orig_char)
                 return
             end
             if char == "\n" or char == "\r" then
-                -- 回车：提交缓冲（同双空格），换行继续走原路 ——
-                -- 对话框 onReturn 确认 / vterm 发送回车执行。
+                -- 回车：提交缓冲（同双空格）。
                 self:vCommit(inputbox, true)
+                -- vterm：vCommit 已用 _vtCommitDraft 把正文发 PTY；这里必须吞掉
+                -- 本次回车。若落回原生分支写 "\n"，差分看到 appended="正文\n" ≠
+                -- 所按字符会判为组词而不发，"\n" 残留草稿；下次回车时两个换行
+                -- 一起发 → 连续两次回车。吞掉后第一次回车只上字、第二次才执行，
+                -- 与普通拼音组合态回车（吞首次）一致。
+                -- 标准 InputDialog 无此方法：仍落回原生分支触发 onReturn 确认。
+                if type(inputbox._vtCommitDraft) == "function" then return end
                 -- 不 return："\n" 落回下方原生分支（separate + raw addChars）
             else
                 -- 单空格进缓冲（Hello World）；全角标点转半角（：。，！等）；
@@ -1176,6 +1219,21 @@ function IME:wrappedAddChars(inputbox, char, orig_char)
             self:vPush(inputbox, 0)
             return
         end
+    end
+
+    -- imebar: Enter on a live composition commits the RAW typed code instead of
+    -- converting it to a candidate, and SWALLOWS the Enter (no newline/confirm).
+    -- The input box already holds the raw letters ("yes", "How"); imebar_code_len
+    -- only marks the pinyin suffix separate() would delete. Dropping the stack
+    -- without writing any staged char leaves the raw code in place; returning
+    -- here keeps "\n" from reaching the dialog (confirm) or vterm (PTY newline).
+    -- A SECOND Enter sees an empty stack, fails this guard, and falls through to
+    -- the native path — i.e. "yes"+Enter types "yes", Enter again confirms.
+    -- Only the bar mode is affected; stock/vterm (inline_code=false) is untouched.
+    if isPinyin(self) and self.imebar_inline_code and self.imebar_code_len > 0
+        and (char == "\n" or char == "\r") then
+        self:clear_stack()
+        return
     end
 
     local imex = _stack[#_stack]
