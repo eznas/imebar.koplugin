@@ -8,6 +8,8 @@
 local logger = require("logger")
 local util = require("util")
 local Utf8Proc = require("ffi/utf8proc")
+-- imebar: 精确测量候选渲染宽度（根治候选超宽被 TextWidget 截断丢字）
+local RenderText = require("ui/rendertext")
 
 -- imebar: candidates per page (1 stage char + digits 2-9 + 0 as the 10th pick)
 local PAGE = 10
@@ -93,14 +95,21 @@ end
 local function looseMatch(code, learned, code_map)
     if #code < 2 or #code > #learned then return false end
     if code:byte(1) ~= learned:byte(1) then return false end
+    -- imebar: abbreviations are initials only — EVERY letter must be a consonant.
+    -- A vowel anywhere means this is a (complete or partial) full spelling, which
+    -- getCandiFromMap handles; letting it into the abbreviation pool makes e.g.
+    -- "shi" loose-match the learned 鼠标垫/shubiaodian at 标's medial "i" (rank 1).
+    -- Extends the old "2nd letter must be consonant" guard to all positions.
+    for k = 1, #code do
+        local ch = code:byte(k)
+        if ch == 97 or ch == 101 or ch == 105 or ch == 111
+            or ch == 117 or ch == 118 then return false end -- a/e/i/o/u/v
+    end
     local is_prefix = learned:sub(1, #code) == code
     if is_prefix then
         -- a pure prefix is a valid abbreviation only past syllable 1
         return crossedFirstSyllable(code, code_map)
     end
-    local second = code:byte(2)
-    if second == 97 or second == 101 or second == 105 or second == 111
-        or second == 117 or second == 118 then return false end -- a/e/i/o/u/v
     local i, last_pos = 2, 1
     for j = 2, #learned do
         if code:byte(i) == learned:byte(j) then
@@ -140,39 +149,59 @@ local function fuzzy_variants(code, rules)
     return variants
 end
 
--- imebar: display width of a string in CJK-char units (CJK=1, ASCII=0.5)
-local function textUnits(s)
-    local w = 0
-    for _, ch in ipairs(util.splitToChars(s)) do
-        w = w + (ch:byte(1) >= 0xE0 and 1 or 0.5)
-    end
-    return w
+-- imebar: 每页候选数（含舞台字），按「键盘上方条带」的**精确渲染宽度**折算。
+-- 根治候选超宽丢字：原用 CJK=1/ASCII=0.5 估算，与 TextWidget 的 kerning 渲染
+-- 有偏差，边界时完整串超 max_width 被尾部截断（数字在、候选字丢）。现直接用
+-- imebar 发布的真实 face 对象量宽度，与绘制同一套 sizeUtf8Text(...,true)。
+-- 几何由 _imebar_geo（face + avail_w）提供；缺失时回退 PAGE，绝不闪退。
+local function textWidthPx(s, face)
+    if not face then return 0 end
+    local ok, w = pcall(function()
+        return RenderText:sizeUtf8Text(0, nil, face, s, true, false).x
+    end)
+    return ok and w or 0
 end
 
--- imebar: 每页候选数（含舞台字），按「键盘上方条带」的实际宽度折算。
--- 长词组候选（如多字词）会把整串撑过屏宽，若不缩减数量，条带会把前半截
--- （含舞台字）裁掉 —— 正是要修的问题。做法同 imeplus：舞台字 + "[" "]"
--- 起算，逐个装编号候选（0.5 数字前缀 + 词宽），装不下就停并给尾部 "…"
--- 预留 0.5；返回本页总数 S（1 个舞台字 + n 个编号候选）。数字选字范围
--- (nd<=S) 与翻页步长 (+=S) 都取这里，三者一致。
--- 几何由条带在 init 时发布到类表字段 _imebar_geo（精确 face.size + 宽度），
--- 避免引擎另取字体的时机不一致。缺失时回退 PAGE（旧行为），绝不闪退。
 local function visiblePageSize(imex, inputbox)
     local engine = package.loaded["ui/data/keyboardlayouts/generic_ime"]
     local geo = engine and engine._imebar_geo
-    local face_size = geo and geo.face_size
+    local face = geo and geo.face
     local bar_w = geo and geo.avail_w
-    if not face_size or not bar_w or face_size <= 0 or bar_w <= 0 then return PAGE end
-    local avail = bar_w / face_size - 2 -- 光标/取整安全余量
-    local units = textUnits(imex.char or "") + 1 -- 舞台字 + "[" "]"
+    if not face or not bar_w or bar_w <= 0 then
+        -- 无精确几何：回退旧估算（绝不闪退）
+        face = nil
+        local size = PAGE
+        return size
+    end
+    local avail = bar_w - 8 -- 光标/取整安全余量(px)
+    -- 舞台字 + "[" + "]" 的固定开销；has_prev 时 "[" 后还会加 "..."（getHintChars
+    -- 行 876），必须预留，否则翻到第 2 页时多出的 3 点未计入又超宽丢字。
+    local dots_w = textWidthPx("...", face)
+    -- 第一页舞台字 = candi[1]（index=1）无 prev；翻页后 index>1 有 prev。
+    -- 不用 getPages/curPageNo —— 那会递归（getPages 反过来调本函数）。
+    local has_prev = imex.index > 1
+    -- 舞台字 = 所有 _stack 层 char 拼接（与 getHintChars:863 / getBarLayout:963
+    -- 完全一致）。此前用 imex.char 只量最后一层：连续输入 yiyiyiyiyiy 时多层
+    -- 累积成"意义意义…"，只量末层一个字 → 严重低估 → 多选候选 → 真机绘制
+    -- 超宽被 TextWidget 尾部截断（末尾 5一言不发6... 无]）。
+    local stage = ""
+    if _stack then
+        for i = 1, #_stack do stage = stage .. (_stack[i].char or "") end
+    end
+    -- _stack 尚未初始化（引擎初始化前的探测路径）：回退用 imex.char，绝不崩。
+    if stage == "" then stage = imex.char or "" end
+    local fixed = textWidthPx(stage .. "[]", face)
+        + (has_prev and dots_w or 0)
     local last = math.min(imex.index + PAGE - 1, #imex.candi)
     local n = 0
     for i = imex.index + 1, last do
-        local cand_units = 0.5 + textUnits(imex.candi[i])
+        local n_label = (i - imex.index + 1)
+        local label = (n_label == 10 and "0" or tostring(n_label))
+        local cand_w = textWidthPx(label .. imex.candi[i], face)
         local truncated = i < last or last < #imex.candi
-        local need = cand_units + (truncated and 0.5 or 0) -- 尾部 "…"
-        if units + need <= avail then
-            units = units + cand_units
+        local need = cand_w + (truncated and dots_w or 0)
+        if fixed + need <= avail then
+            fixed = fixed + cand_w
             n = n + 1
         else
             break
@@ -624,48 +653,60 @@ function IME:getCandidates(code)
     return self:getCandiFromMap(code) or self:searchStartWith(code)
 end
 
--- imebar: merge candidates of the typed code and its fuzzy variants,
--- exact hits first, then prefix matches; original code always ranks first.
+-- imebar: merge candidates of the typed code and its fuzzy variants.
+-- 用户要求「模糊音按字频排序」——原实现分桶追加（正确码全部在前、模糊变体
+-- 全部在后），现改为：每个 stock 候选用它在码表里的名次当字频分（越靠前越
+-- 常用），原码与所有模糊变体的候选按字频分统一交织排序。学习/自定义词仍
+-- 保持最高优先级（用负 usage 分），避免用户习惯被字频冲掉。
 function IME:getMergedCandidates(code)
-    local merged, seen = {}, {}
-    local function addCandi(candi)
+    local seen, orig = {}, {} -- seen[v]=字频分; orig[v]=是否来自原码(同分tie-break)
+    -- score 越小越靠前；-1e6 起给学习/自定义词，stock 字频用 0..名次。
+    local function addCandi(candi, score, is_original)
         if type(candi) == "string" then candi = { candi } end
-        if candi then
-            for _, v in ipairs(candi) do
-                if not seen[v] then
-                    seen[v] = true
-                    merged[#merged+1] = v
-                end
+        if not candi then return false end
+        local added = false
+        for _, v in ipairs(candi) do
+            local old = seen[v]
+            if not old or score < old or (score == old and is_original and not orig[v]) then
+                seen[v] = score
+                orig[v] = is_original == true -- 覆盖时同步来源标记
+                added = true
             end
         end
+        return added
     end
-    addCandi(self:getExactLearned(code)) -- habit wins over the stock table order
+    for i, w in ipairs(self:getExactLearned(code) or {}) do
+        addCandi(w, -1000000 + i) -- habit/custom first, by usage (getExactLearned sorted)
+    end
     local exact = self:getCandiFromMap(code)
-    addCandi(exact)
+    local function addRanked(candi, base, is_original)
+        if type(candi) == "string" then candi = { candi } end
+        for i, v in ipairs(candi or {}) do addCandi(v, (base or 0) + i, is_original) end
+    end
+    addRanked(exact, 0, true) -- 原码同字分时优先于模糊变体
     local user, user_matched = self:getUserCandi(code)
-    addCandi(user) -- learned words rank after exact hits, before variants
+    for i, w in ipairs(user or {}) do addCandi(w, -1000000 + i) end
     local variants = fuzzy_variants(code)
     local variant_hit = false
     for _, v in ipairs(variants) do
         local hit = self:getCandiFromMap(v)
         if hit then variant_hit = true end
-        addCandi(hit)
+        addRanked(hit, 0) -- 同一字频标尺（名次），与原码候选统一交织
     end
-    if #merged > 0 then
-        -- 前缀扩展只在「原始码没有任何精确命中」时做：它本是为简拼/未完成码
-        -- 补长词（"meiy" 要能出 没有）。若 fangfa 已精确命中 方法，再做
-        -- getAllStartsWith("fangfa") 会把 fangfan(防范)/fangfang(芳芳) 等同头
-        -- 码的词全拉进来 —— 正是用户看到的一堆"不相关"候选。
-        -- 模糊变体同理：只做精确码命中，不各自做前缀扩展。
-        if not exact and not variant_hit then
-            addCandi(self:getAllStartsWith(code, 12))
-        end
-        if user_matched and user_matched[1] and #user_matched[1].c > #code then
-            addCandi(self:getAllStartsWith(user_matched[1].c:sub(1, #code + 1), 12))
-        end
-        return merged
+    if not exact and not variant_hit and not user then
+        addRanked(self:getAllStartsWith(code, 12), 10000) -- 前缀扩展候选垫底
     end
-    addCandi(self:getAllStartsWith(code, 12))
+    if user_matched and user_matched[1] and #user_matched[1].c > #code then
+        addRanked(self:getAllStartsWith(user_matched[1].c:sub(1, #code + 1), 12), 20000)
+    end
+    local merged = {}
+    for v in pairs(seen) do merged[#merged+1] = v end
+    table.sort(merged, function(a, b)
+        local sa, sb = seen[a], seen[b]
+        if sa ~= sb then return sa < sb end
+        if orig[a] ~= orig[b] then return orig[a] == true end -- 同字频原码优先
+        return a < b -- 再按字串稳定排序
+    end)
     return merged
 end
 
@@ -911,16 +952,17 @@ end
 
 -- imebar: 当前页触摸选字布局（imebar.lua 据此算点击命中矩形）。镜像上面
 -- getHintChars 的编号窗口分支：同一时刻调用（包裹体里紧跟 getHintChars），
--- 状态一致。不显示编号窗口的态（非拼音/无候选/自定义码前缀吞码/页大小<2）
--- 返回 nil，条带在这些态下没有任何可点矩形。
+-- 状态一致。非拼音/无候选/自定义码前缀吞码返回 nil，条带无可点矩形。
+-- 单候选（如 wadi）时 getHintChars 不显示方括号窗口、条带只画舞台字（=唯一
+-- 候选），此时仍返回 layout（stage=该字、cands 空），点舞台字即提交（n=1）——
+-- 否则单候选下条带无任何命中盒，触摸选字无效。
 function IME:getBarLayout(inputbox)
     if not isPinyin(self) then return nil end
     local imex = _stack[#_stack]
-    if not (self:show_candi_callback() and #imex.candi > 1 and #imex.code > 0) then return nil end
+    if not (self:show_candi_callback() and #imex.candi >= 1 and #imex.code > 0) then return nil end
     local starts = getPages(imex, inputbox)
     local page_no = curPageNo(starts, imex.index)
     local page_size = pageSizeAt(starts, page_no, #imex.candi)
-    if page_size < 2 then return nil end
     local cands = {}
     local last = math.min(imex.index + page_size - 1, #imex.candi)
     for i = imex.index + 1, last do

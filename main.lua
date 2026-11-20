@@ -617,6 +617,46 @@ function ImeBarPlugin:addToMainMenu(menu_items)
         sorting_hint = "more_tools",
         sub_item_table = {
             {
+                -- 字条字号：SpinWidget 选值后应用。范围 18..64，默认(未设置)
+                -- 随屏幕短边自适应。vterm widget 模式读同一 key，两边同步。
+                text = L("字条字号", "Bar font size"),
+                keep_menu_open = true,
+                callback = function()
+                    local SpinWidget = require("ui/widget/spinwidget")
+                    local G = rawget(_G, "G_reader_settings")
+                    local saved = G and G:readSetting("imebar_font_size")
+                    local ImeBar = require("imebar")
+                    local default = ImeBar.defaultFontSize()
+                    local cur = (type(saved) == "number" and saved >= 18 and saved <= 64)
+                        and saved or default
+                    local dlg
+                    dlg = SpinWidget:new{
+                        title_text = L("字条字号", "Bar font size"),
+                        value = cur, value_min = 18, value_max = 64, value_step = 1,
+                        default_value = default,
+                        ok_text = L("应用", "Apply"),
+                        -- SpinWidget 的 callback 传的是控件自身(self)，不是数字！
+                        -- 值在 self.value（spinwidget.lua:226 已 getValue 写入）。
+                        -- 上一版误写成 function(value) 把整个控件 table 当字号存了，
+                        -- 下次 ImeBar:init 读时 type(number) 判定失败 → 回退默认，
+                        -- 表现就是「字号改完自动复原」（加 flush 也没用）。
+                        callback = function(widget)
+                            local value = widget and widget.value
+                            if value == default then
+                                if G then G:delSetting("imebar_font_size") end
+                            elseif G then
+                                G:saveSetting("imebar_font_size", value)
+                            end
+                            -- saveSetting 只写内存，必须 flush 才落盘（重启/强杀路径）。
+                            if G and G.flush then G:flush() end
+                            -- 热更新正在显示的条带：重建 face/条高并刷掉旧像素。
+                            if bar then bar:reinitFontSize() end
+                        end,
+                    }
+                    require("ui/uimanager"):show(dlg)
+                end,
+            },
+            {
                 -- 勾选框区点击即开关模糊拼音；点行进二级菜单编辑模糊规则
                 text = L("模糊拼音", "Fuzzy pinyin"),
                 checked_func = function() return G_reader_settings:readSetting("imebar_fuzzy", true) end,
