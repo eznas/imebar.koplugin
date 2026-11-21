@@ -503,6 +503,7 @@ function IME:clear_stack()
     self.imebar_code = ""
     self.v_text = nil -- imebar: "v" english passthrough buffer
     self.v_in_field = nil -- imebar: v 缓冲当前是否直写在输入框（无条带退回路径）
+    self._literal = nil -- imebar: 直通字符缓冲(显示层拼接用), 已随提交上屏故清空
 end
 
 function IME:reset_status()
@@ -1434,6 +1435,14 @@ function IME:wrappedAddChars(inputbox, char, orig_char)
             end
         else
             self:separate(inputbox)
+            -- 直通字符(大写字母/未映射符号)不进拼音码桶 —— 显示层(条带/拼音码
+            -- preedit)只跟码桶走, 直通字符会完全隐形, 直到回车收口才随草稿一起
+            -- 上屏(vterm 打 "Test": T 预览缺失, 只显 est)。记录到 _literal 供
+            -- 显示层拼接; separate 已清旧值, 这里记新值顺序正确。
+            -- 回车/换行走组合提交或收口, 不是显示内容, 不记。
+            if char ~= "\n" and char ~= "\r" then
+                self._literal = (self._literal or "") .. (orig_char or char)
+            end
             inputbox.addChars:raw_method_call(orig_char or char)
         end
     end
