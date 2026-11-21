@@ -19,6 +19,7 @@
 - **自定义词组表**：菜单「自定义词组表」内直接编辑；纯中文词自动生成简拼码，网址/英文/中英混合词显式给码（`http://… bd`）。保存后下次开键盘即生效，无需重启
 - **模糊拼音**：zh/z、ch/c、sh/s 三对平翘舌（默认开），菜单可逐项开关
 - **v 模式**：`v` 开头直出半角英文，`vhello` + 双空格 → `hello`；全角标点自动转半角；回车提交并换行
+- **🌐 键布局快速切换（v0.6.2）**：单击软键盘左下角 🌐 键切回上一个用过的布局（拼音 ↔ 英文往返，不必翻遍布局列表），再按切回；无记录时走原生循环，长按菜单/滑动选布局不变。同名原生补丁已提上游 PR（koreader#16424）
 - **vterm 兼容（v0.5.3）**：暴露 `package.loaded["imebar_api"].setExternalSink` 外部候选出口——vterm 检测到后把辣条候选画进自己的自绘条带位，不叠条、不误发 PTY；EN 布局/关终端时注销
 
 ### 安装
@@ -44,6 +45,7 @@ Pure plugin (engine takeover via `package.loaded`, runtime wrapping only) — **
 - **Custom phrases**: edited in-menu; pure CJK phrases get auto initials, URLs/mixed words take an explicit code (`http://… bd`). Effective on next keyboard open.
 - **Fuzzy pinyin**: the three retroflex/flat pairs (zh/z, ch/c, sh/s) on by default, per-pair toggles in the menu.
 - **v-mode**: type `v` first for raw half-width English (`vhello` + double space → `hello`); full-width punctuation is converted; Enter commits and breaks the line.
+- **Globe key layout toggle (v0.6.2)**: tapping the 🌐 key at the keyboard's bottom-left switches back to the previously used layout (bounce between pinyin and English without cycling the whole list); tap again to switch back. Falls back to native cycling when nothing is recorded; hold menu and swipe layout picks are unchanged. The same behavior is proposed upstream (koreader#16424).
 - **vterm compat (v0.5.3)**: exposes an external candidate sink (`package.loaded["imebar_api"].setExternalSink`) so vterm paints the strip's candidates into its own bar position — no stacked strip, no stray PTY bytes.
 
 ### Install

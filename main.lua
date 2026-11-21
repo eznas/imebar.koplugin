@@ -17,6 +17,7 @@ require 先查 loaded 再查 preload，且 imebar 按路径排序先于 imeplus 
   IME:getHintChars             → 完整串推给条带（内容不变跳过重绘）
   IME:clear_stack              → 提交/重置时清条带
   VirtualKeyboard:setVisibility / onClose / setKeyboardLayout → 条带显隐 + 引擎门控
+  VirtualKeyboard:addKeys      → 🌐 键单击换「切回上一个布局」A↔B 快速切换
 
 门控：仅当开关开启、zh_CN 拼音布局、且条带真正显示（hasRoom）时接管；
 否则 getHintChars 纯透传、引擎走原生内联候选（开关关闭 / 非拼音布局 /
@@ -136,6 +137,40 @@ local PINYIN_LAYOUT = "zh_CN"
 local function pinyinLayout(layout)
     return (layout or (G_reader_settings
         and G_reader_settings:readSetting("keyboard_layout"))) == PINYIN_LAYOUT
+end
+
+-- 🌐 键（左下角布局循环键）A↔B 快速切换：单击切回上一个用过的布局，再按切回
+-- （中↔英往返不用翻遍布局列表）；无记忆/插件禁用时回退原生循环，长按布局菜单
+-- 与四向滑动选布局保持原生不动。prev_layout 在 setKeyboardLayout 收口处记录，
+-- 切换时辣条条带照常跟随（英文布局收起、拼音布局恢复）。
+-- 挂在 addKeys 上：init / setKeyboardLayout / setLayer（Shift/Sym 层）所有键
+-- 重建路径都汇到这里，每次重建出的新键都重新替换单击回调。
+local prev_layout = nil -- 上一个用过的布局（会话内存）
+
+local function wrapGlobeKey(kb)
+    if type(kb.layout) ~= "table" then return end
+    for _, row in ipairs(kb.layout) do
+        if type(row) == "table" then
+            for _, vk in ipairs(row) do
+                if type(vk) == "table"
+                    and kb.utf8mode_keys and kb.utf8mode_keys[vk.label] ~= nil
+                    and type(vk.callback) == "function" then
+                    local orig_cb = vk.callback
+                    vk.callback = function()
+                        local cur = G_reader_settings
+                            and G_reader_settings:readSetting("keyboard_layout")
+                        if not enabled() or not prev_layout or prev_layout == cur then
+                            orig_cb() -- 首次无记忆 / 禁用：原生循环
+                            return
+                        end
+                        local kbd = vk.keyboard
+                        kbd:onSwitchingKeyboardLayout()
+                        kbd:setKeyboardLayout(prev_layout)
+                    end
+                end
+            end
+        end
+    end
 end
 
 -- 条带跟随键盘显隐：show 时同步引擎「输入框显拼音码」门控。
@@ -290,6 +325,7 @@ local function install()
     if type(VirtualKeyboard.setVisibility) ~= "function"
         or type(VirtualKeyboard.onClose) ~= "function"
         or type(VirtualKeyboard.init) ~= "function"
+        or type(VirtualKeyboard.addKeys) ~= "function"
         or type(VirtualKeyboard.setKeyboardLayout) ~= "function"
         or type(ImeBar) ~= "table" then
         logger.warn("imebar: core API mismatch, native input stays")
@@ -350,11 +386,22 @@ local function install()
     -- init() 按新布局重建键盘但不走 setVisibility，条带需在此显式跟随。
     local orig_setLayout = VirtualKeyboard.setKeyboardLayout
     VirtualKeyboard.setKeyboardLayout = function(self, layout)
+        -- 🌐 A↔B 记忆：真实切换（新值≠旧值）时记下切换前的布局
+        local old = G_reader_settings and G_reader_settings:readSetting("keyboard_layout") or nil
         local ret = orig_setLayout(self, layout)
+        if old and old ~= layout then prev_layout = old end
         if installed then
             barFollowKeyboard(self, self.visible and enabled() and pinyinLayout(layout))
         end
         return ret
+    end
+
+    -- 🌐 键单击换 A↔B 快速切换：键的重建收口（init/setKeyboardLayout/setLayer
+    -- 都走 addKeys），每次重建后重新替换。
+    local orig_addKeys = VirtualKeyboard.addKeys
+    VirtualKeyboard.addKeys = function(self)
+        orig_addKeys(self)
+        if installed then guarded(function() wrapGlobeKey(self) end) end
     end
 
     return true
