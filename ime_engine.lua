@@ -1439,11 +1439,16 @@ function IME:wrappedAddChars(inputbox, char, orig_char)
             -- preedit)只跟码桶走, 直通字符会完全隐形, 直到回车收口才随草稿一起
             -- 上屏(vterm 打 "Test": T 预览缺失, 只显 est)。记录到 _literal 供
             -- 显示层拼接; separate 已清旧值, 这里记新值顺序正确。
-            -- 回车/换行走组合提交或收口, 不是显示内容, 不记。
-            if char ~= "\n" and char ~= "\r" then
-                self._literal = (self._literal or "") .. (orig_char or char)
+            -- 只记单字节 ASCII 可打印(0x20-0x7E): 多字节字符(日文假名等非拼音
+            -- 布局直通)不记 —— 否则切布局后 _literal 残留长假名串, vterm preedit
+            -- 越画越宽, invertRect 光标块越界成键盘上的灰方块(2026-11-21 真机)。
+            -- 换行/回车走组合提交或收口, 也不是显示内容。上限 60 防失控。
+            local oc = orig_char or char
+            local lit = self._literal or ""
+            if #oc == 1 and oc:byte(1) >= 0x20 and oc:byte(1) <= 0x7E and #lit < 60 then
+                self._literal = lit .. oc
             end
-            inputbox.addChars:raw_method_call(orig_char or char)
+            inputbox.addChars:raw_method_call(oc)
         end
     end
 end
